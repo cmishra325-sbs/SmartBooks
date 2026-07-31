@@ -1,0 +1,72 @@
+# SBS-INF-001 — Infrastructure Architecture
+
+**Version:** Draft v0.2  
+**Status:** 🔵 In Review  
+**Owner:** Platform Architecture  
+**Priority:** Critical (Runtime & Operations)  
+**Related Specs:** [SBS-DM-001_Domain_Model.md](file:///C:/Users/Chandan%20Mishra/Documents/Antigravity/SmartBooks/docs/product/SBS-DM-001_Domain_Model.md), [SBS-ARCH-001_Solution_Blueprint.md](file:///c:/Users/Chandan%20Mishra/Documents/Antigravity/SmartBooks/docs/architecture/SBS-ARCH-001_Solution_Blueprint.md), [SBS-MOD-001_Module_Architecture.md](file:///c:/Users/Chandan%20Mishra/Documents/Antigravity/SmartBooks/docs/architecture/SBS-MOD-001_Module_Architecture.md), [SBS-APP-001_Application_Architecture.md](file:///c:/Users/Chandan%20Mishra/Documents/Antigravity/SmartBooks/docs/architecture/SBS-APP-001_Application_Architecture.md), [SBS-AI-001_AI_Services_Architecture.md](file:///c:/Users/Chandan%20Mishra/Documents/Antigravity/SmartBooks/docs/architecture/SBS-AI-001_AI_Services_Architecture.md)
+
+---
+
+## 1. Purpose & Runtime Topology
+
+This specification defines the runtime environments, process isolation boundaries, secret injection pipelines, and deployment invariants for the SmartBooks platform. Designed around the **Twelve-Factor App** methodology, the platform executes as stateless processes, ensuring cloud portability and scalability.
+
+---
+
+## 2. Twelve-Factor Stateless Process Isolation
+
+The web server and analytical/AI components execute in separate process spaces to ensure that CPU/memory-heavy tasks do not degrade cashier checkout experiences:
+
+```
+                  [External Traffic Router / Load Balancer]
+                                     │
+         ┌───────────────────────────┴───────────────────────────┐
+         ▼ (Short REST/POS HTTP Calls)                           ▼ (Long AI/Event Jobs)
+┌─────────────────────────────────┐                     ┌─────────────────────────────────┐
+│       Web / API Process         │                     │    Background Worker Process    │
+│  • Memory Limit: 512MB-1GB      │                     │  • Memory Limit: 1GB-2GB        │
+│  • Handles HTTP Requests        │                     │  • Polls webhook_inbox, outbox  │
+│  • Bounded execution (< 30s)    │                     │  • Triggers Gemini AI API calls │
+└────────────────┬────────────────┘                     └────────────────┬────────────────┘
+                 │                                                       │
+                 └───────────────► [Shared Database] ◄───────────────────┘
+```
+
+* **Web/API Runtime**: A lightweight, stateless process optimized for rapid transaction dispatch. Any task expected to exceed 500ms is deferred to the background worker.
+* **Background Worker Runtime**: A separate process pool dedicated to executing long-running asynchronous tasks (PDF generation, WhatsApp dispatches, AI document extraction, ledger syncs).
+
+---
+
+## 3. Configuration & Secrets Injection
+
+In compliance with Twelve-Factor security guidelines:
+* **Storage**: Under no circumstances are secrets (database URLs, Gemini API keys, payment certificates) stored in config files, JSON manifests, or repository files.
+* **Injection**: Secrets are injected strictly as **Environment Variables** (`process.env.*`) at runtime by the container or hosting platform.
+* **Local Development**: Developer setups use a local `.env` file that is explicitly excluded from Git version control via `.gitignore`.
+* **Production**: Injected using a secure key-vault service (e.g. AWS Secrets Manager, GCP Secret Manager, or Vault).
+
+---
+
+## 4. Dev/Prod Database Parity (Docker Compose Standard)
+
+To eliminate "works on my machine" deployment bugs:
+* **Standard**: The local development database must replicate the production engine (PostgreSQL) using **Docker Compose** containers.
+* **Rule**: Developers are prohibited from using SQLite, H2, or in-memory database mocks for local development testing, as these engines lack PostgreSQL-specific features like schema authorization, JSONB indexes, and Row-Level Security (RLS).
+
+---
+
+## 5. Background Job Broker Abstraction
+
+To support eventually consistent integration flows without locking runtime dependencies:
+* **Port Interface**: Application code triggers background work via a standard job scheduler interface (e.g. `IBackgroundJobManager.enqueue(task)`).
+* **Monolith Implementation (V1)**: The job adapter uses a database-backed queue table (such as `PgBoss` or polling on the `webhook_inbox` / `outbox_events` tables) utilizing PostgreSQL transactions.
+* **Microservices Implementation**: Swaps the infrastructure adapter to use a distributed message broker (RabbitMQ, Redis BullMQ, or AWS SQS) in the deployment configuration without altering code.
+
+---
+
+## 6. Observability: Correlation Log Streams
+
+* **Log Standard**: Application and container logs must be output to `stdout` as structured JSON streams.
+* **Tracing**: Every log entry generated by Web or Background processes must include the `correlationId` passed in the request metadata envelope. Centralized log collectors (Elastic, Datadog, CloudWatch) aggregate these streams to allow end-to-end trace queries across processes.
+* **Health Endpoint**: Both runtimes expose `/health/live` (process availability) and `/health/ready` (backing service connectivity, e.g. checking database connection pool) endpoints for load-balancer monitoring.
